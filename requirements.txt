@@ -1,0 +1,9 @@
+fiona
+geopandas
+networkx
+numpy
+pandas
+rasterio
+scipy
+shapely
+# GDAL/osgeo doit correspondre à l'installation locale de GDAL ou de QGIS.
