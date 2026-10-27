@@ -1,0 +1,12 @@
+# Données confidentielles et entrées géospatiales
+data/
+outputs/
+*.gpkg
+*.csv
+*.tif
+*.tiff
+
+# Fichiers locaux Python et macOS
+__pycache__/
+*.py[cod]
+.DS_Store
