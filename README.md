@@ -43,16 +43,6 @@ utilise cette valeur. Ce cas ne se produit pas dans les résultats définitifs.
 
 Les quatre poids de qualité sont tirés avec une loi Dirichlet(1,1,1,1).
 
-## Exécution
-
-Le script demande un environnement Python géographique compatible avec GDAL,
-Fiona, Rasterio et GeoPandas. Il peut notamment être exécuté avec Python dans
-QGIS.
-
-```text
-python montecarlo.py
-```
-
 Les fichiers créés sont :
 
 - `risultati_top1.csv` ;
