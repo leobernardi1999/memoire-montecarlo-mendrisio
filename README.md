@@ -1,4 +1,4 @@
-# Annexe numérique — modèle de Monte-Carlo
+# Modèle de Monte-Carlo
 
 Ce dépôt contient le script utilisé pour exécuter le modèle de Monte-Carlo du
 scénario central présenté dans le mémoire.
