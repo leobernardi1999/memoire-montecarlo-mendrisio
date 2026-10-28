@@ -5,6 +5,7 @@ outputs/
 *.csv
 *.tif
 *.tiff
+*.vrt
 
 # Fichiers locaux Python et macOS
 __pycache__/

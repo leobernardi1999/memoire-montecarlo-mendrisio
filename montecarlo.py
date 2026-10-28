@@ -1,357 +1,384 @@
-# STEP 1 - Importazione librerie e caricamento dei dati
+# ÉTAPE 1 - Chargement des données
 # ============================================================
-import math #Per le funzioni trigonometriche usate nel calcolo della pendenza
-import os #Per lavorare con cartelle e percorsi del computer
-import tempfile #Per creare temporaneamente il mosaico dei raster altimetrici
+# Cette partie charge les fichiers nécessaires et contrôle que les données
+# principales sont disponibles avant de commencer les calculs.
+import math  # Pour calculer les angles de pente.
+import os  # Pour travailler avec les dossiers et les chemins des fichiers.
+import tempfile  # Pour créer un dossier temporaire.
 
-# Quando lo script è eseguito con il Python incluso in QGIS su macOS, indico
-# esplicitamente dove si trova il database dei sistemi di coordinate.
-QGIS_PROJ_DIR = "/Applications/QGIS-LTR.app/Contents/Resources/proj"
-if "PROJ_LIB" not in os.environ and os.path.isdir(QGIS_PROJ_DIR):
-    os.environ["PROJ_LIB"] = QGIS_PROJ_DIR
+# Indique où trouver PROJ (outil qui permet de comprendre un système de
+# coordonnées comme EPSG:2056). Ce chemin correspond à QGIS sur macOS.
+# Si QGIS se trouve ailleurs, seul le chemin entre guillemets doit être adapté.
+CARTELLA_PROJ_QGIS = "/Applications/QGIS-LTR.app/Contents/Resources/proj"
+if "PROJ_LIB" not in os.environ and os.path.isdir(CARTELLA_PROJ_QGIS):
+    os.environ["PROJ_LIB"] = CARTELLA_PROJ_QGIS  # Utilise ce chemin s'il existe.
 
-import fiona #PEr leggere i layer dentro un GeoPackage
-import geopandas as gpd #Per gestire dati geografici
-import networkx as nx #Per analizzare il grafo stradale. Trasforma le strade in una rete di nodi ed archi
-import numpy as np #Per calcoli numerici
-import pandas as pd #Per tabelle e riassunti finali
-import rasterio #Per campionare le quote del modello numerico di terreno
+import fiona  # Lit la liste des couches du GeoPackage.
+import geopandas as gpd  # Pour travailler avec les données géographiques.
+import networkx as nx  # Pour créer le réseau routier et calculer les parcours.
+import numpy as np  # Pour les calculs et les tirages aléatoires.
+import pandas as pd  # Pour travailler avec les tableaux.
+import rasterio  # Pour lire les altitudes de swissALTI3D.
 
-from osgeo import gdal #Per riunire virtualmente i raster swissALTI3D senza modificarli
-from shapely.geometry import LineString, MultiLineString #Per riconoscere le geometrie lineari della rete stradale
-from scipy.spatial import cKDTree #Per trovare rapidamente il nodo della rete più vicino a un punto
+from osgeo import gdal  # Pour réunir les fichiers d'altitude sans les modifier.
+from shapely.geometry import LineString, MultiLineString  # Pour lire les routes.
+from scipy.spatial import cKDTree  # Pour trouver rapidement le nœud le plus proche.
 
-# Percorso del GeoPackage nella stessa cartella dello script
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) #Trova la cartella in cui si trova il file montecarlo.py. SCRIPT_DIR diventa quella cartella    
-GPKG_PATH = os.path.join(SCRIPT_DIR, "montecarlo.gpkg") #Costruisce il pecorso completo del Geopackage. GPKG_PATH diventa il percorso completo del file montecarlo.gpkg. Cerca il file .gpkg nella stessa cartella dello script montecarlo.py
+CARTELLA_SCRIPT = os.path.dirname(os.path.abspath(__file__))  # Dossier de ce script.
 
-# Cartella contenente le tessere swissALTI3D in formato GeoTIFF.
-# Per rendere il codice trasferibile, si può:
-# 1) creare una sottocartella "swissALTI3D" accanto allo script; oppure
-# 2) definire la variabile d'ambiente SWISSALTI3D_DIR con il percorso dei raster.
-DEM_DIR = os.environ.get(
+# Par défaut, le GeoPackage doit être à côté du script et porter ce nom.
+# S'il se trouve ailleurs, ce chemin doit être remplacé par son chemin complet.
+PERCORSO_GPKG = os.path.join(CARTELLA_SCRIPT, "montecarlo.gpkg")
+
+# Par défaut, les fichiers swissALTI3D sont cherchés dans un dossier
+# "swissALTI3D" placé dans le même dossier que le script.
+# S'ils restent dans un autre dossier, son chemin doit être indiqué au moment
+# de lancer le script.
+CARTELLA_DEM = os.environ.get(
     "SWISSALTI3D_DIR",
-    os.path.join(SCRIPT_DIR, "swissALTI3D")
+    os.path.join(CARTELLA_SCRIPT, "swissALTI3D")
 )
 
-# Le strade non vengono spezzate nel grafo: 20 m è soltanto il passo massimo
-# usato per campionare le quote lungo ciascun arco esistente.
-MAX_SLOPE_SUBSEGMENT_M = 20.0
+# Les routes ne sont pas coupées tous les 20 m. Cette valeur sert seulement à
+# décider tous les combien de mètres les altitudes sont lues.
+PASSO_MASSIMO_PENDENZA_M = 20.0
 
-# Controllo che il file esista
-if not os.path.exists(GPKG_PATH): #Esiste questo file nel computer?
-    raise FileNotFoundError(f"GeoPackage non trovato: {GPKG_PATH}")  #Interrompi il programma e mostra un errore
+# Le programme s'arrête si le GeoPackage n'est pas trouvé.
+if not os.path.exists(PERCORSO_GPKG):
+    raise FileNotFoundError(f"GeoPackage non trovato: {PERCORSO_GPKG}")
 
+# Ces lignes affichent le fichier effectivement utilisé.
 print("GeoPackage trovato:")
-print(GPKG_PATH) #Stampa il percorso
+print(PERCORSO_GPKG)
 
-# Controllo dei layer presenti
-layers = fiona.listlayers(GPKG_PATH) #Apre il GeoPackage e legge i nomi dei layer presenti. layers diventa una lista di nomi dei layer. Li salva nella variabile layers.
+# Vérifie les couches disponibles dans le GeoPackage.
+livelli = fiona.listlayers(PERCORSO_GPKG)
 print("\nLayer presenti:")
-print(layers)
+print(livelli)
 
-# Caricamento dei layer principali
-rete = gpd.read_file(GPKG_PATH, layer="rete_strade") #Apri il layer "rete_strade" del GeoPackage e salvalo nella variabile rete. 
-abitazioni = gpd.read_file(GPKG_PATH, layer="abitazioni") #Apri il layer "abitazioni" del GeoPackage e salvalo nella variabile abitazioni.
-poi = gpd.read_file(GPKG_PATH, layer="poi") #Apri il layer "poi" del GeoPackage e salvalo nella variabile poi.
+# Ces trois noms doivent correspondre aux couches du GeoPackage.
+# Avec un autre GeoPackage, les noms entre guillemets sont à adapter ici.
+rete = gpd.read_file(PERCORSO_GPKG, layer="rete_strade")  # Réseau routier.
+abitazioni = gpd.read_file(PERCORSO_GPKG, layer="abitazioni")  # Points de départ des domiciles.
+poi = gpd.read_file(PERCORSO_GPKG, layer="poi")  # Points d'intérêt.
 
-# Trasformazione logaritmica del traffico.
-# Il calcolo avviene sulla copia caricata in memoria: il GeoPackage sorgente
-# non viene modificato. I segmenti senza DTV sono trattati come DTV = 0,
-# conformemente all'ipotesi dichiarata nella tesi.
-DTV_MAX = float(pd.to_numeric(rete["DTV_FZG"], errors="coerce").max())
-if DTV_MAX != 16495.0:
-    raise ValueError(f"Valore massimo DTV inatteso: {DTV_MAX}")
+# Le score de trafic utilise le logarithme naturel. Dans ce script, les valeurs
+# DTV absentes sont considérées comme nulles.
+# La colonne DTV_FZG contient le trafic journalier moyen de chaque route.
+# Dans ces données, la valeur maximale doit être 16495.
+# Ce contrôle permet de repérer si un autre fichier a été chargé par erreur.
+DTV_MASSIMO = float(pd.to_numeric(rete["DTV_FZG"], errors="coerce").max())
+if DTV_MASSIMO != 16495.0:
+    raise ValueError(f"Valore massimo DTV inatteso: {DTV_MASSIMO}")
 
 dtv = (
     pd.to_numeric(rete["DTV_FZG"], errors="coerce")
     .fillna(0.0)
     .clip(lower=0.0)
 )
-rete["traf_score"] = 1.0 - np.log1p(dtv) / np.log1p(DTV_MAX)
+# Plus le trafic augmente, plus le score se rapproche de 0.
+rete["traf_score"] = 1.0 - np.log1p(dtv) / np.log1p(DTV_MASSIMO)
 
-# Controllo rapido dei dati caricati
+# Résumé simple pour contrôler le nombre d'éléments chargés.
 print("\nElementi caricati:")
-print(f"Rete stradale: {len(rete)} archi") #Quante righe contiene rete? Ogni riga è un arco (edge, tratto di strada che collega due nodi) della rete stradale. Stampa il numero di archi.
-print(f"Abitazioni: {len(abitazioni)} punti") #Quante righe contiene abitazioni? Ogni riga è un punto che rappresenta un'abitazione. Stampa il numero di abitazioni.
-print(f"POI: {len(poi)} punti") #Quante righe contiene poi? Ogni riga è un punto che rappresenta un POI. Stampa il numero di POI.
+print(f"Rete stradale: {len(rete)} archi")
+print(f"Abitazioni: {len(abitazioni)} punti")
+print(f"POI: {len(poi)} punti")
 
-# Controllo del sistema di coordinate
+# Affiche les systèmes de coordonnées pour vérifier qu'ils sont compatibles.
 print("\nCRS:")
 print(f"Rete: {rete.crs}")
 print(f"Abitazioni: {abitazioni.crs}")
 print(f"POI: {poi.crs}")
 
 # ============================================================
-# STEP 2 - Ricostruzione della pendenza e creazione del grafo
+# ÉTAPE 2 - Recalcul de la pente et création du graphe
 # ============================================================
+# Utilise les routes chargées avant et les altitudes swissALTI3D pour calculer
+# la pente. Le résultat est ensuite transformé en réseau de nœuds et de routes.
 
-# Velocità media di cammino del bambino in metri/secondo
-WALK_SPEED = 1.2
-
-
-def iter_lines(geometry):
-    """Restituisce le singole linee contenute in una geometria stradale."""
-    if isinstance(geometry, LineString):
-        yield geometry
-    elif isinstance(geometry, MultiLineString):
-        yield from geometry.geoms
+# Vitesse de marche retenue (m/s).
+VELOCITA_CAMMINO = 1.2
 
 
-def build_edge_records(roads):
-    """
-    Prepara gli archi del grafo senza modificarne la topologia.
-    Ogni coppia di coordinate consecutive rimane un unico arco.
-    """
-    edge_records = []
+def iter_lines(geometria):
+    """Permet de lire de la même façon une route formée d'une ou de plusieurs lignes."""
+    if isinstance(geometria, LineString):
+        yield geometria
+    elif isinstance(geometria, MultiLineString):
+        yield from geometria.geoms
 
-    for _, row in roads.iterrows():
-        for line in iter_lines(row.geometry):
-            coords = list(line.coords)
 
-            for index in range(len(coords) - 1):
-                start = tuple(coords[index][:2])
-                end = tuple(coords[index + 1][:2])
-                length_m = float(LineString([start, end]).length)
+def build_edge_records(strade):
+    """Prépare chaque morceau de route pour construire le graphe."""
+    dati_archi = []
 
-                if length_m <= 0:
+    # Parcourt toutes les routes et leurs coordonnées.
+    for _, riga in strade.iterrows():
+        for linea in iter_lines(riga.geometry):
+            coordinate = list(linea.coords)
+
+            # Deux coordonnées consécutives forment un morceau de route.
+            for indice in range(len(coordinate) - 1):
+                inizio = tuple(coordinate[indice][:2])
+                fine = tuple(coordinate[indice + 1][:2])
+                lunghezza_m = float(LineString([inizio, fine]).length)
+
+                if lunghezza_m <= 0:
                     continue
 
-                edge_records.append({
-                    "start": start,
-                    "end": end,
-                    "length_m": length_m,
-                    "traf_score": float(row["traf_score"]),
-                    "marcia": float(row["marcia"]),
-                    "green_score": float(row["green_score"]),
-                    # Il vecchio valore è conservato soltanto come controllo di
-                    # sicurezza per un eventuale arco fuori dalla copertura DEM.
-                    "old_slope_score": float(row["slope_score"])
+                # Chaque morceau garde les facteurs de qualité de sa route d'origine.
+                dati_archi.append({
+                    "start": inizio,
+                    "end": fine,
+                    "length_m": lunghezza_m,
+                    "traf_score": float(riga["traf_score"]),
+                    "marcia": float(riga["marcia"]),
+                    "green_score": float(riga["green_score"]),
+                    # Ancien score utilisé seulement si une altitude manque.
+                    "old_slope_score": float(riga["slope_score"])
                 })
 
-    return edge_records
+    return dati_archi
 
 
-def recalculate_slope_scores(edge_records, raster, maximum_subsegment_length):
+def recalculate_slope_scores(dati_archi, raster_quote, passo_massimo_m):
     """
-    Calcola la pendenza assoluta di ogni arco stradale.
-
-    Per il solo campionamento altimetrico, ciascun arco i viene suddiviso in
-    sotto-tronconi j lunghi al massimo 20 m. L'angolo di ciascun sotto-troncone
-    è calcolato dalle quote delle sue estremità; gli angoli sono poi aggregati
-    sull'arco originale con una media ponderata per la lunghezza. Infine la
-    pendenza media è invertita e normalizzata tra 0 e 1.
+    Calcule la pente de chaque route avec les altitudes swissALTI3D.
+    Pour lire les altitudes, chaque route est considérée par parties égales de
+    20 m au maximum. Une valeur proche de 1 indique une route plate et une
+    valeur proche de 0 une forte pente.
     """
-    sample_coordinates = []
-    sample_jobs = []
+    # Points où les altitudes devront être lues.
+    coordinate_quote = []
+    # Pour chaque partie, garde la route, la longueur et les deux points utiles.
+    parti_da_calcolare = []
 
-    for edge_index, edge in enumerate(edge_records):
-        length_m = edge["length_m"]
-        subsegment_count = max(
+    for indice_arco, arco in enumerate(dati_archi):
+        lunghezza_m = arco["length_m"]
+        # Nombre de parties nécessaire pour ne jamais dépasser 20 m.
+        numero_parti = max(
             1,
-            int(math.ceil(length_m / maximum_subsegment_length))
+            int(math.ceil(lunghezza_m / passo_massimo_m))
         )
-        subsegment_length = length_m / subsegment_count
-        x_start, y_start = edge["start"]
-        x_end, y_end = edge["end"]
+        lunghezza_parte = lunghezza_m / numero_parti  # Longueur réelle d'une partie.
+        x_inizio, y_inizio = arco["start"]  # Début du morceau de route.
+        x_fine, y_fine = arco["end"]  # Fin du morceau de route.
 
-        for number in range(subsegment_count):
-            fraction_start = number / subsegment_count
-            fraction_end = (number + 1) / subsegment_count
+        # Calcule les coordonnées du début et de la fin de chaque partie.
+        for numero in range(numero_parti):
+            frazione_inizio = numero / numero_parti  # Début entre 0 et 1.
+            frazione_fine = (numero + 1) / numero_parti  # Fin entre 0 et 1.
 
-            first_index = len(sample_coordinates)
-            sample_coordinates.append((
-                x_start + (x_end - x_start) * fraction_start,
-                y_start + (y_end - y_start) * fraction_start
+            # Garde la position du premier point dans la liste des coordonnées.
+            indice_inizio = len(coordinate_quote)
+            # Place le début de cette partie le long du morceau de route.
+            # Une fraction de 0 correspond au début et une fraction de 1 à la fin.
+            coordinate_quote.append((
+                x_inizio + (x_fine - x_inizio) * frazione_inizio,
+                y_inizio + (y_fine - y_inizio) * frazione_inizio
             ))
 
-            second_index = len(sample_coordinates)
-            sample_coordinates.append((
-                x_start + (x_end - x_start) * fraction_end,
-                y_start + (y_end - y_start) * fraction_end
+            # Garde ensuite la position du deuxième point dans la même liste.
+            indice_fine = len(coordinate_quote)
+            # Place la fin de cette partie de la même manière.
+            coordinate_quote.append((
+                x_inizio + (x_fine - x_inizio) * frazione_fine,
+                y_inizio + (y_fine - y_inizio) * frazione_fine
             ))
 
-            sample_jobs.append((
-                edge_index,
-                subsegment_length,
-                first_index,
-                second_index
+            # Mémorise à quelle route appartient cette partie, sa longueur et
+            # les deux positions qui permettront de retrouver ses altitudes.
+            parti_da_calcolare.append((
+                indice_arco,
+                lunghezza_parte,
+                indice_inizio,
+                indice_fine
             ))
 
-    sampled_elevations = np.asarray(
-        [value[0] for value in raster.sample(sample_coordinates)],
+    # Lit toutes les altitudes en une seule fois.
+    quote_lette = np.asarray(
+        [valore[0] for valore in raster_quote.sample(coordinate_quote)],
         dtype=float
     )
 
-    if raster.nodata is not None:
-        sampled_elevations[
-            np.isclose(sampled_elevations, raster.nodata)
+    # Les points sans altitude valide ne sont pas utilisés dans la moyenne.
+    if raster_quote.nodata is not None:
+        quote_lette[
+            np.isclose(quote_lette, raster_quote.nodata)
         ] = np.nan
 
-    weighted_angle_sum = np.zeros(len(edge_records), dtype=float)
-    valid_length_sum = np.zeros(len(edge_records), dtype=float)
-    total_length_sum = np.zeros(len(edge_records), dtype=float)
+    # Sommes utilisées pour calculer la pente moyenne de chaque route.
+    somma_angoli_pesata = np.zeros(len(dati_archi), dtype=float)  # Angles et longueurs.
+    somma_lunghezze_valide = np.zeros(len(dati_archi), dtype=float)  # Parties avec deux altitudes.
+    somma_lunghezze_totali = np.zeros(len(dati_archi), dtype=float)  # Toutes les parties.
 
-    for edge_index, length_m, first_index, second_index in sample_jobs:
-        total_length_sum[edge_index] += length_m
-        z_start = sampled_elevations[first_index]
-        z_end = sampled_elevations[second_index]
+    for indice_arco, lunghezza_m, indice_inizio, indice_fine in parti_da_calcolare:
+        somma_lunghezze_totali[indice_arco] += lunghezza_m
+        quota_inizio = quote_lette[indice_inizio]  # Altitude au début de la partie.
+        quota_fine = quote_lette[indice_fine]  # Altitude à la fin de la partie.
 
-        if not (np.isfinite(z_start) and np.isfinite(z_end)):
+        if not (np.isfinite(quota_inizio) and np.isfinite(quota_fine)):
             continue
 
-        angle_deg = math.degrees(
-            math.atan(abs(z_end - z_start) / length_m)
+        # Angle calculé avec la différence d'altitude et la longueur.
+        angolo_gradi = math.degrees(
+            math.atan(abs(quota_fine - quota_inizio) / lunghezza_m)
         )
-        weighted_angle_sum[edge_index] += angle_deg * length_m
-        valid_length_sum[edge_index] += length_m
+        somma_angoli_pesata[indice_arco] += angolo_gradi * lunghezza_m
+        somma_lunghezze_valide[indice_arco] += lunghezza_m
 
-    mean_angles = np.divide(
-        weighted_angle_sum,
-        valid_length_sum,
-        out=np.full(len(edge_records), np.nan, dtype=float),
-        where=valid_length_sum > 0
+    # Moyenne des angles en donnant plus de poids aux parties plus longues.
+    angoli_medi = np.divide(
+        somma_angoli_pesata,
+        somma_lunghezze_valide,
+        out=np.full(len(dati_archi), np.nan, dtype=float),
+        where=somma_lunghezze_valide > 0
     )
 
-    if not np.isfinite(mean_angles).any():
+    if not np.isfinite(angoli_medi).any():
         raise ValueError("Nessuna quota swissALTI3D valida sulla rete")
 
-    maximum_angle = float(np.nanmax(mean_angles))
-    if maximum_angle <= 0:
+    angolo_massimo = float(np.nanmax(angoli_medi))
+    if angolo_massimo <= 0:
         raise ValueError("Pendenza massima non valida")
 
-    slope_scores = 1.0 - mean_angles / maximum_angle
-    dem_coverage = np.divide(
-        valid_length_sum,
-        total_length_sum,
-        out=np.zeros(len(edge_records), dtype=float),
-        where=total_length_sum > 0
+    # Transforme les angles en scores compris entre 0 et 1.
+    score_pendenze = 1.0 - angoli_medi / angolo_massimo
+    # Part de chaque route pour laquelle une altitude valide a été trouvée.
+    copertura_dem = np.divide(
+        somma_lunghezze_valide,
+        somma_lunghezze_totali,
+        out=np.zeros(len(dati_archi), dtype=float),
+        where=somma_lunghezze_totali > 0
     )
 
-    return slope_scores, dem_coverage, maximum_angle
+    return score_pendenze, copertura_dem, angolo_massimo
 
 
-edge_records = build_edge_records(rete)
+# Transforme rete en morceaux de route et conserve leurs facteurs de qualité.
+dati_archi = build_edge_records(rete)
 
-# Le tessere restano file separati: il VRT è soltanto un mosaico virtuale
-# temporaneo e non modifica i raster originali.
-dem_tiles = sorted([
-    os.path.join(DEM_DIR, filename)
-    for filename in os.listdir(DEM_DIR)
-    if filename.startswith("swissalti3d_2022_") and filename.endswith(".tif")
-]) if os.path.isdir(DEM_DIR) else []
+# Le VRT est un fichier temporaire qui permet de lire toutes les tuiles
+# swissALTI3D comme une seule image, sans modifier les fichiers originaux.
+# Seuls les fichiers .tif dont le nom commence par "swissalti3d_2022_" sont lus.
+# Si les fichiers portent un autre nom, ce début de nom doit être adapté ici.
+tessere_dem = sorted([
+    os.path.join(CARTELLA_DEM, nome_file)
+    for nome_file in os.listdir(CARTELLA_DEM)
+    if nome_file.startswith("swissalti3d_2022_") and nome_file.endswith(".tif")
+]) if os.path.isdir(CARTELLA_DEM) else []
 
-if not dem_tiles:
+if not tessere_dem:
     raise FileNotFoundError(
         "Nessun raster swissALTI3D trovato. Inserire le tessere nella cartella "
-        f"{DEM_DIR} oppure definire SWISSALTI3D_DIR."
+        f"{CARTELLA_DEM} oppure definire SWISSALTI3D_DIR."
     )
 
-with tempfile.TemporaryDirectory() as temporary_directory:
-    vrt_path = os.path.join(temporary_directory, "swissalti3d_mosaic.vrt")
-    vrt = gdal.BuildVRT(vrt_path, dem_tiles)
+# Le dossier et le VRT temporaires sont supprimés automatiquement à la fin.
+with tempfile.TemporaryDirectory() as cartella_temporanea:
+    percorso_vrt = os.path.join(cartella_temporanea, "swissalti3d_mosaic.vrt")
+    mosaico_vrt = gdal.BuildVRT(percorso_vrt, tessere_dem)
 
-    if vrt is None:
+    if mosaico_vrt is None:
         raise RuntimeError("Impossibile creare il mosaico virtuale swissALTI3D")
 
-    vrt.FlushCache()
-    vrt = None
+    mosaico_vrt.FlushCache()
+    mosaico_vrt = None
 
-    with rasterio.open(vrt_path) as elevation_raster:
-        if rete.crs is not None and elevation_raster.crs != rete.crs:
+    with rasterio.open(percorso_vrt) as raster_quote:
+        # Les altitudes et les routes doivent utiliser le même système de coordonnées.
+        if rete.crs is not None and raster_quote.crs != rete.crs:
             raise ValueError(
                 "Il CRS dei raster swissALTI3D non coincide con quello della rete"
             )
 
-        slope_scores, dem_coverage, maximum_slope_angle = recalculate_slope_scores(
-            edge_records,
-            elevation_raster,
-            MAX_SLOPE_SUBSEGMENT_M
+        score_pendenze, copertura_dem, angolo_massimo_pendenza = recalculate_slope_scores(
+            dati_archi,
+            raster_quote,
+            PASSO_MASSIMO_PENDENZA_M
         )
 
-# Grafo non orientato: ogni strada può essere percorsa nei due sensi.
-# La topologia, le lunghezze e i tempi sono identici alla versione precedente.
-G = nx.Graph()
-fallback_edges = 0
+# Chaque route peut être parcourue dans les deux sens.
+grafo = nx.Graph()
+archi_senza_quote = 0
 
-for edge_index, edge in enumerate(edge_records):
-    if np.isfinite(slope_scores[edge_index]):
-        slope_score = float(slope_scores[edge_index])
-        slope_source = "swissALTI3D"
+# Ajoute au réseau chaque morceau de route et ses caractéristiques.
+for indice_arco, arco in enumerate(dati_archi):
+    if np.isfinite(score_pendenze[indice_arco]):
+        score_pendenza = float(score_pendenze[indice_arco])
+        fonte_pendenza = "swissALTI3D"
     else:
-        slope_score = edge["old_slope_score"]
-        slope_source = "fallback_vecchio_indicatore"
-        fallback_edges += 1
+        # Utilise l'ancien score seulement si swissALTI3D ne donne rien.
+        score_pendenza = arco["old_slope_score"]
+        fonte_pendenza = "fallback_vecchio_indicatore"
+        archi_senza_quote += 1
 
-    G.add_edge(
-        edge["start"],
-        edge["end"],
-        length_m=edge["length_m"],
-        time_min=edge["length_m"] / WALK_SPEED / 60,
-        traf_score=edge["traf_score"],
-        marcia=edge["marcia"],
-        green_score=edge["green_score"],
-        slope_score=slope_score,
-        slope_dem_coverage=float(dem_coverage[edge_index]),
-        slope_source=slope_source
+    grafo.add_edge(
+        arco["start"],
+        arco["end"],
+        length_m=arco["length_m"],
+        time_min=arco["length_m"] / VELOCITA_CAMMINO / 60,  # Temps à pied en minutes.
+        traf_score=arco["traf_score"],
+        marcia=arco["marcia"],
+        green_score=arco["green_score"],
+        slope_score=score_pendenza,
+        copertura_dem=float(copertura_dem[indice_arco]),
+        slope_source=fonte_pendenza
     )
 
+# Affiche les contrôles sur les altitudes et le réseau obtenu.
 print("\nPendenza ricostruita da swissALTI3D:")
-print(f"Tessere DEM: {len(dem_tiles)}")
-print(f"Passo massimo di campionamento: {MAX_SLOPE_SUBSEGMENT_M:.0f} m")
-print(f"Angolo medio massimo osservato: {maximum_slope_angle:.6f}°")
-print(f"Archi senza alcuna quota valida (fallback): {fallback_edges}")
+print(f"Tessere DEM: {len(tessere_dem)}")
+print(f"Passo massimo di campionamento: {PASSO_MASSIMO_PENDENZA_M:.0f} m")
+print(f"Angolo medio massimo osservato: {angolo_massimo_pendenza:.6f}°")
+print(f"Archi senza alcuna quota valida: {archi_senza_quote}")
 
 print("\nGrafo creato:")
-print(f"Nodi: {G.number_of_nodes()}")
-print(f"Archi: {G.number_of_edges()}")
+print(f"Nodi: {grafo.number_of_nodes()}")
+print(f"Archi: {grafo.number_of_edges()}")
 
 # ============================================================
-# STEP 3 - Aggancio di abitazioni e POI alla rete
+# ÉTAPE 3 - Rattachement des domiciles et des POI au réseau
 # ============================================================
+# Utilise le réseau créé à l'étape 2. Chaque point de départ et chaque POI est
+# associé au nœud du réseau qui se trouve le plus près.
 
-# Lista dei nodi del grafo
-nodes = list(G.nodes()) #Prendo tutti i nodi creati prima. Nodes diventa una lista di tutte le coordinate dei nodi del grafo. Ogni nodo è una tupla (x, y).
-node_coords = np.array(nodes) #Trasformo lista in un array numpy. Più comodo per dare i calcoli spaziali.
+# Récupère la liste des nœuds du réseau et leurs coordonnées.
+nodi = list(grafo.nodes())
+coordinate_nodi = np.array(nodi)
 
-# Struttura spaziale per trovare rapidamente il nodo più vicino
-tree = cKDTree(node_coords) #Crea una struttura spaziale per trovare rapidamente il nodo più vicino a un punto. tree diventa un oggetto che permette di fare ricerche spaziali veloci.
-
-
-def find_nearest_node(point): #Funzione riceve un punto (una casa o un POI)
-    """
-    Trova il nodo della rete più vicino a un punto.
-    Restituisce il nodo e la distanza in metri.
-    """
-
-    dist, idx = tree.query([point.x, point.y]) #Trova il nodo più vicino al punto dato. dist diventa la distanza in metri tra il punto e il nodo più vicino. idx diventa il nodo più vicino nella lista dei nodi.
-    return nodes[idx], dist
+# Prépare une recherche rapide du nœud le plus proche.
+albero_ricerca = cKDTree(coordinate_nodi)
 
 
-def snap_points_to_network(gdf): #Prende un GeoDataFrame di punti. L'intera tabella per esempio tutte la abitazioni. Per ogni ra della tabella usa findnearest_node() per trovare il nodo più vicino e la distanza. Aggiunge due colonne al GeoDataFrame: nearest_node e snap_dist_m.
-    """
-    Aggancia ogni punto del GeoDataFrame al nodo più vicino della rete.
-    Aggiunge due colonne:
-    - nearest_node: nodo più vicino
-    - snap_dist_m: distanza dal nodo più vicino
-    """
+def find_nearest_node(punto):
+    """Trouve le nœud le plus proche et calcule la distance en mètres."""
 
-    gdf = gdf.copy() #Crea una copia del GeoDataFrame per non modificare l'originale. gdf diventa una copia del GeoDataFrame originale.
-    gdf["nearest_node"] = None #Crea una nuova colonna nel GeoDataFrame per salvare il nodo più vicino a ogni punto. Inizialmente è vuota (None).
-    gdf["snap_dist_m"] = None #Crea una nuova colonna nel GeoDataFrame per salvare la distanza dal nodo più vicino a ogni punto. Inizialmente è vuota (None).
-
-    for idx, row in gdf.iterrows(): #Scorre ogni punto della tabella per ogni abitazione o POI.
-        node, dist = find_nearest_node(row.geometry) #Chiama la funzione di prima per trovare il nodo più vicino e la distanza. node diventa il nodo più vicino al punto. dist diventa la distanza in metri tra il punto e il nodo più vicino.
-        gdf.at[idx, "nearest_node"] = node #Salva il nodo più vicino nella colonna "nearest_node" del GeoDataFrame.
-        gdf.at[idx, "snap_dist_m"] = dist #Salva la distanza dal nodo più vicino nella colonna "snap_dist_m" del GeoDataFrame.
-
-    return gdf
+    distanza, indice = albero_ricerca.query([punto.x, punto.y])
+    return nodi[indice], distanza
 
 
-# Aggancio alla rete
-abitazioni = snap_points_to_network(abitazioni) #Aggancia le abitazioni alla rete stradale. La funzione snap_points_to_network() prende il GeoDataFrame delle abitazioni e aggiunge due colonne: nearest_node e snap_dist_m. La colonna nearest_node contiene il nodo più vicino della rete stradale per ogni abitazione, mentre la colonna snap_dist_m contiene la distanza in metri tra l'abitazione e il nodo più vicino.
-poi = snap_points_to_network(poi) #Aggancia i POI alla rete stradale nello stesso modo delle abitazioni. 
+def snap_points_to_network(punti_geografici):
+    """Ajoute à chaque point le nœud le plus proche et sa distance."""
 
+    punti_geografici = punti_geografici.copy()  # La table originale n'est pas modifiée.
+    punti_geografici["nearest_node"] = None  # Nœud trouvé sur le réseau.
+    punti_geografici["snap_dist_m"] = None  # Distance entre le point et ce nœud.
+
+    # Cherche le nœud le plus proche pour chaque point de départ ou POI.
+    for indice, riga in punti_geografici.iterrows():
+        nodo, distanza = find_nearest_node(riga.geometry)
+        punti_geografici.at[indice, "nearest_node"] = nodo
+        punti_geografici.at[indice, "snap_dist_m"] = distanza
+
+    return punti_geografici
+
+
+abitazioni = snap_points_to_network(abitazioni)
+poi = snap_points_to_network(poi)
+
+# Affiche les distances obtenues et les points situés à plus de 70 m.
 print("\nAggancio alla rete completato.")
 
 print("\nDistanze di aggancio abitazioni:")
@@ -373,344 +400,363 @@ print(poi.loc[
 ])
 
 # ============================================================
-# STEP 4 - Calcolo dei percorsi casa -> POI entro 15 minuti
+# ÉTAPE 4 - Parcours domicile-POI accessibles en 15 minutes
 # ============================================================
+# Utilise les points reliés au réseau à l'étape 3. Les parcours les plus rapides
+# sont calculés et seuls ceux qui durent au maximum 15 minutes sont conservés.
 
-MAX_TIME = 15  # soglia massima di accessibilità in minuti
+TEMPO_MASSIMO = 15  # Temps maximal retenu pour atteindre un POI à pied.
 
-records = [] #Lista vuota per salvare i risultati. 
-fallback_edges_used = set() #Controllo: nessun percorso analizzato deve usare il fallback.
+righe_percorsi = []  # Parcours qui respectent la limite de 15 minutes.
+archi_senza_quote_usati = set()  # Contrôle des routes sans altitude valide.
 
 
-def calculate_path_means(path): #Path è una lista di nodi che rappresenta il percorso più breve tra una casa e un POI. La funzione calcola le caratteristiche medie del percorso, ponderate per la lunghezza dei segmenti attraversati.
+def calculate_path_means(percorso):
     """
-    Calcola le caratteristiche medie del percorso.
-    Ogni score viene ponderato per la lunghezza dei segmenti attraversati.
+    Calcule la moyenne des quatre critères sur un parcours. Les routes plus
+    longues comptent davantage que les routes plus courtes.
     """
 
-    length_tot = 0 #Si inizializzano dei contenitori, sono tutti uguale a zero perchè nessun segmento è stato analizzato. Lenght_tot serv per sommare la lunghezza totale del percorso.
-    traf_sum = 0 #Serve per sommare il punteggio di traffico ponderato per la lunghezza dei segmenti attraversati.
-    marcia_sum = 0 #Serve per sommare il punteggio di marciapiede ponderato per la lunghezza dei segmenti attraversati.
-    green_sum = 0 #Serve per sommare il punteggio di verde ponderato per la lunghezza dei segmenti attraversati.
-    slope_sum = 0 #Serve per sommare il punteggio di pendenza ponderato per la lunghezza dei segmenti attraversati.
+    # Chaque somme commence à 0, puis reçoit les valeurs de chaque route.
+    lunghezza_totale = 0  # Longueur totale du parcours.
+    somma_traffico = 0  # Trafic multiplié par la longueur des routes.
+    somma_marciapiede = 0  # Trottoirs multipliés par la longueur des routes.
+    somma_verde = 0  # Végétation multipliée par la longueur des routes.
+    somma_pendenza = 0  # Pente multipliée par la longueur des routes.
 
-    for i in range(len(path) - 1): #Serve per scorrere tutti i segmenti del percorso. Ogni segmento è definito da due nodi consecutivi nella lista path.
-        u = path[i] #Nodi consecutivi.
-        v = path[i + 1]
+    # Parcourt toutes les routes qui composent le parcours.
+    for indice in range(len(percorso) - 1):
+        nodo_inizio = percorso[indice]  # Premier nœud du morceau.
+        nodo_fine = percorso[indice + 1]  # Nœud suivant.
 
-        edge = G[u][v] #Prende il pezzo di strada tra questi due nodi del Grafo. 
-        length = edge["length_m"] #Prende lunghezza del segmento.
+        arco = grafo[nodo_inizio][nodo_fine]  # Informations entre les deux nœuds.
+        lunghezza = arco["length_m"]  # Longueur de ce morceau.
 
-        length_tot += length #Aggiorna la lunghezza totale del percorso. Diventa length_tot = length_tot + length.
-        traf_sum += edge["traf_score"] * length #Aggiorna la somma ponderata del punteggio di traffico. 
-        marcia_sum += edge["marcia"] * length #Aggiorna la somma ponderata del punteggio di marciapiede.
-        green_sum += edge["green_score"] * length #Aggiorna la somma ponderata del punteggio di verde.
-        slope_sum += edge["slope_score"] * length #Aggiorna la somma ponderata del punteggio di pendenza.
+        lunghezza_totale += lunghezza
+        somma_traffico += arco["traf_score"] * lunghezza
+        somma_marciapiede += arco["marcia"] * lunghezza
+        somma_verde += arco["green_score"] * lunghezza
+        somma_pendenza += arco["slope_score"] * lunghezza
 
-        if edge["slope_source"] != "swissALTI3D":
-            fallback_edges_used.add(tuple(sorted((u, v))))
+        # Note les routes qui utilisent encore l'ancien score de pente.
+        if arco["slope_source"] != "swissALTI3D":
+            archi_senza_quote_usati.add(tuple(sorted((nodo_inizio, nodo_fine))))
 
-    return { #Restituisce un dizionario con le caratteristiche medie del percorso. Ogni punteggio medio è calcolato come la somma ponderata divisa per la lunghezza totale del percorso.
-        "length_m": length_tot,
-        "traf_mean": traf_sum / length_tot,
-        "marcia_mean": marcia_sum / length_tot,
-        "green_mean": green_sum / length_tot,
-        "slope_mean": slope_sum / length_tot
+    # Divise les sommes par la longueur totale pour obtenir les quatre moyennes.
+    return {
+        "length_m": lunghezza_totale,
+        "traf_mean": somma_traffico / lunghezza_totale,
+        "marcia_mean": somma_marciapiede / lunghezza_totale,
+        "green_mean": somma_verde / lunghezza_totale,
+        "slope_mean": somma_pendenza / lunghezza_totale
     }
 
 
-for _, casa in abitazioni.iterrows(): #Passa una per una tutte le abitazioni, riga per riga. - indica che non ci interessa l'indice della riga. Ci interessa casa, cioè la riga dell'abitazione.
+# Essaie chaque combinaison entre un domicile et un POI.
+for _, casa in abitazioni.iterrows():
 
-    casa_id = casa["id"] #Recupera informazioni della casa.
+    casa_id = casa["id"]
     quartiere = casa["quartiere"]
-    start_node = casa["nearest_node"]
+    nodo_partenza = casa["nearest_node"]
 
-    for _, p in poi.iterrows(): #Dentro ogni casa, guarda tutti i POI
+    for _, punto_poi in poi.iterrows():
 
-        poi_id = p["poi_id"] #Recupera le info dei POI.
-        poi_name = p["type"]
-        end_node = p["nearest_node"]
+        poi_id = punto_poi["poi_id"]
+        nome_poi = punto_poi["type"]
+        nodo_arrivo = punto_poi["nearest_node"]
 
-        try: #Non sempre esiste, dunque si fa try.
-            # Percorso più breve in termini di tempo
-            path = nx.shortest_path( #si usa NetworkX per calcolare il percorso più breve tra due nodi del grafo. Restituisce il percorso.
-                G,
-                source=start_node,
-                target=end_node,
-                weight="time_min" #Si cerca il percorso più veloce in minuti.
-            )
-
-            tempo_min = nx.shortest_path_length( #Restituisce il costo del percorso più breve tra due nodi del grafo. In questo caso il tempo in minuti.
-                G,
-                source=start_node,
-                target=end_node,
+        try:
+            # Liste des nœuds du parcours le plus rapide à pied.
+            percorso = nx.shortest_path(
+                grafo,
+                source=nodo_partenza,
+                target=nodo_arrivo,
                 weight="time_min"
             )
 
-            # Tengo solo i POI raggiungibili entro 15 minuti
-            if tempo_min <= MAX_TIME:
+            # Durée totale de ce même parcours.
+            tempo_min = nx.shortest_path_length(
+                grafo,
+                source=nodo_partenza,
+                target=nodo_arrivo,
+                weight="time_min"
+            )
 
-                path_stats = calculate_path_means(path) #Richiamo la funzione di prima per calcolare le caratteristiche medie del percorso. path_stats diventa un dizionario con le caratteristiche medie del percorso.
+            # Seuls les parcours de 15 minutes ou moins sont conservés.
+            if tempo_min <= TEMPO_MASSIMO:
 
-                records.append({ #Aggiunge il percorso nella lista dei risultati, se è un POI entro 15 minuti. Ogni percorso è rappresentato da un dizionario con le informazioni della casa, del POI e le caratteristiche medie del percorso.
+                # Calcule les quatre facteurs moyens du parcours retenu.
+                medie_percorso = calculate_path_means(percorso)
+
+                righe_percorsi.append({
                     "casa_id": casa_id,
                     "quartiere": quartiere,
                     "poi_id": poi_id,
-                    "poi_name": poi_name,
+                    "poi_name": nome_poi,
                     "tempo_min": tempo_min,
-                    **path_stats # Aggiungi dentro il dizionario anche tutte le coppie contenute in path_stats.
+                    **medie_percorso
                 })
 
         except nx.NetworkXNoPath:
-            # Se non esiste un percorso tra casa e POI, il caso viene ignorato
+            # Le couple domicile-POI est ignoré si aucun parcours n'existe.
             continue
 
 
-percorsi = gpd.GeoDataFrame(records) # Trasformo la lista records in una tabllea GeoPandas. Però non è una tabella con la geometria vera e propria.
+percorsi = gpd.GeoDataFrame(righe_percorsi)  # Réunit tous les parcours dans un tableau.
 
-if fallback_edges_used:
+# Arrête le programme si un parcours utilise une pente non recalculée.
+if archi_senza_quote_usati:
     raise ValueError(
         "Almeno un percorso analizzato usa un arco senza copertura swissALTI3D"
     )
 
+# Affiche les contrôles et un aperçu des parcours conservés.
 print("\nControllo copertura DEM dei percorsi analizzati:")
-print("Nessun percorso entro 15 minuti usa il valore di fallback.")
+print("Nessun percorso entro 15 minuti usa il valore precedente.")
 
 print("\nPercorsi casa -> POI entro 15 minuti:")
-print(f"Numero righe: {len(percorsi)}") #Quante righe ha la tabella percorsi.
+print(f"Numero righe: {len(percorsi)}")
 print(percorsi.head())
 
 print("\nNumero POI raggiungibili per abitazione:")
-print(percorsi.groupby("casa_id")["poi_id"].count()) #Stampo una tabella raggruppata per casa che conta quanti POI entro 15 minuti ha ogni casa.
+print(percorsi.groupby("casa_id")["poi_id"].count())
 
 print("\nNumero totale POI nel layer originale:")
-print(poi["poi_id"].nunique()) #Stampo il numero di POI unici nel layer originale.
+print(poi["poi_id"].nunique())
 
 print("\nNumero totale di POI diversi entro 15 minuti:")
-print(percorsi["poi_id"].nunique()) #Stampo il numero di POI unici raggiungibili.
+print(percorsi["poi_id"].nunique())
 
-# Identifico quali POI sono stati raggiunti almeno una volta
-poi_raggiunti = percorsi["poi_id"].unique() 
+poi_raggiunti = percorsi["poi_id"].unique()
 
-# Cerco nel layer originale i POI che non compaiono mai nei percorsi entro 15 minuti
+# Cherche les POI qui ne sont accessibles depuis aucun domicile.
 poi_non_raggiunti = poi[~poi["poi_id"].isin(poi_raggiunti)]
 
 print("\nPOI mai raggiunti entro 15 minuti da nessuna abitazione:")
 print(poi_non_raggiunti[["poi_id", "type"]])
 # ============================================================
-# STEP 5 - Separazione della scuola dagli altri POI
+# ÉTAPE 5 - Séparation de l'école des autres POI
 # ============================================================
+# Part des parcours conservés à l'étape 4. L'école sert seulement à mesurer
+# l'accessibilité; les autres POI passent à la simulation Monte Carlo.
 
-# La scuola viene usata solo come indicatore di accessibilità.
-# Non entra nella simulazione Monte Carlo.
-is_school = percorsi["poi_name"].str.contains("scuola", case=False, na=False) #Faccio mashera booleana.Prendo la colonna dei POI e cerco la parola scuola, ignorando maiuscole e minuscole e righe vuote. Dunque una lista di vero o falso.
+# Repère les parcours qui conduisent à une école.
+e_scuola = percorsi["poi_name"].str.contains("scuola", case=False, na=False)
 
-percorsi_scuola = percorsi[is_school].copy() #Raggruppo solo i percorsi che portano a una scuola. Creo una copia della tabella percorsi con solo le righe dove is_school è True. Con copy credo una tabell autonoma.
-percorsi_mc = percorsi[~is_school].copy() #Qua raggruppo tutto ciò che non è scuola. Creo una copia della tabella percorsi con solo le righe dove is_school è False. Con copy creo una tabella autonoma. Verà usata nel MonteCarlo.
+# Sépare les parcours vers l'école de ceux utilisés dans le Monte Carlo.
+percorsi_scuola = percorsi[e_scuola].copy()
+percorsi_mc = percorsi[~e_scuola].copy()
 
+# Affiche l'accès à l'école et le contenu utilisé dans le Monte Carlo.
 print("\nAccessibilità scuola entro 15 minuti:")
-print( #Stampo solo alcune colonne della tabella percorsi_scuola. Dunque le case che hanno almeno una scuola entro 15 minuti.
+print(
     percorsi_scuola[
         ["casa_id", "quartiere", "poi_id", "poi_name", "tempo_min"]
     ]
 )
 
 print("\nNumero abitazioni con almeno una scuola entro 15 minuti:")
-print(percorsi_scuola["casa_id"].nunique()) #Conta i valori unici, per calcolare quante case hanno accesso ad almeno una scuola entro 15 minuti.
+print(percorsi_scuola["casa_id"].nunique())
 
 print("\nPercorsi usati per il Monte Carlo:")
-print(f"Numero righe: {len(percorsi_mc)}") #prendo il numero delle righe.
-print(f"Numero abitazioni: {percorsi_mc['casa_id'].nunique()}") #Prendo i valori unici.
-print(f"Numero POI: {percorsi_mc['poi_id'].nunique()}") #Prendo i valori unici.
+print(f"Numero righe: {len(percorsi_mc)}")
+print(f"Numero abitazioni: {percorsi_mc['casa_id'].nunique()}")
+print(f"Numero POI: {percorsi_mc['poi_id'].nunique()}")
 
 # ============================================================
-# STEP 6 - Monte Carlo: TOP1, TOP3 e score di tutti i POI
+# ÉTAPE 6 - Monte Carlo: TOP1, TOP3 et score de tous les POI
 # ============================================================
+# Utilise les parcours sans l'école préparés à l'étape 5. Les quatre critères
+# de qualité reçoivent de nouveaux poids à chacune des 1 000 simulations.
 
-# Numero di simulazioni Monte Carlo
-N_SIM = 1000 #1000 modi diversi di pesare le caratteristiche del percorso. Ogni simulazione genera 4 pesi casuali che sommano a 1. I pesi rappresentano l'importanza assegnata a: traffico, marciapiede, verde e pendenza.
+NUMERO_SIMULAZIONI = 1000  # Nombre de simulations réalisées.
 
-# Seme casuale fisso per rendere la simulazione riproducibile.
+# Permet d'obtenir les mêmes tirages à chaque exécution du script.
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
-# Peso dato alla vicinanza e alla qualità del percorso. Per la scelta del POI conta di più la qualità del tragitto che la sola distanza. Lo score finale del POI è calcolato come una media pesata tra la vicinanza e la qualità del percorso. 
-ALPHA_VICINANZA = 0.3
-ALPHA_QUALITA = 0.7
+# Le scénario principal donne 30 % à la proximité et 70 % à la qualité.
+PESO_VICINANZA = 0.3
+PESO_QUALITA = 0.7
 
-# Liste dove salvo i risultati delle simulazioni
-risultati_top1 = [] #Salva il POI migliore per ogni casa in ogni simulazione. Dunque 1000 POI migliori per ogni casa.
-risultati_top3 = [] #Salva i primi tre POI migliori per ogni casa in ogni simulazione. 
-risultati_tutti_score = [] #Salva lo score di tutti i POI raggiungibili per ogni casa in ogni simulazione. 
+# Listes utilisées pour conserver les résultats de chaque simulation.
+risultati_top1 = []
+risultati_top3 = []
+risultati_score = []
 
 
-for sim in range(1, N_SIM + 1): #Inizia ciclo per fare 1000 simulazioni. sim diventa il numero della simulazione corrente, da 1 a 1000.
+for numero_simulazione in range(1, NUMERO_SIMULAZIONI + 1):
 
-    # Genera 4 pesi casuali che sommano sempre a 1
-    # I pesi rappresentano l'importanza assegnata a:
-    # traffico, marciapiede, verde e pendenza
-    w_traf, w_marcia, w_green, w_slope = np.random.dirichlet([1, 1, 1, 1]) #Utile visto che non sappiamo quale criterio pesa di più nella scelta di un bambino.
-
-    temp = percorsi_mc.copy() #Creo copia della tabella con tutti i percorsi casa -> POI raggiungibili entro 15 minuti.
-
-    # Vicinanza: più il tempo è basso, più il valore è alto
-    temp["vicinanza"] = 1 - (temp["tempo_min"] / MAX_TIME) #Calcolo la vicinanza. Più il tempo è basso più questa sarà alta.
-
-    # Qualità del percorso con pesi casuali
-    temp["qualita"] = ( #Calcolo la qualità del percorso come media ponderata dei 4 criteri. Più il punteggio è alto più il percorso è considerato di qualità.
-        w_traf * temp["traf_mean"] +
-        w_marcia * temp["marcia_mean"] +
-        w_green * temp["green_mean"] +
-        w_slope * temp["slope_mean"]
+    # Produit quatre poids aléatoires dont la somme vaut toujours 1.
+    peso_traffico, peso_marciapiede, peso_verde, peso_pendenza = np.random.dirichlet(
+        [1, 1, 1, 1]
     )
 
-    # Score finale del POI 
-    temp["score"] = ( #Calcolo lo score finale del POI che combina la vicinanza e la qualità del percorso. Più lo score è alto più il POI è considerato interessante per il bambino.
-        ALPHA_VICINANZA * temp["vicinanza"] +
-        ALPHA_QUALITA * temp["qualita"]
+    tabella_simulazione = percorsi_mc.copy()  # Copie pour la simulation en cours.
+
+    # Plus le temps est court, plus la proximité est proche de 1.
+    tabella_simulazione["vicinanza"] = 1 - (
+        tabella_simulazione["tempo_min"] / TEMPO_MASSIMO
     )
 
-    # Salvo anche il numero della simulazione e i pesi usati. Così so quali pesi hanno portato a quale risultato. Utile per capire se un certo POI è sempre il migliore o se dipende dai pesi.
-    temp["sim"] = sim
-    temp["w_traf"] = w_traf
-    temp["w_marcia"] = w_marcia
-    temp["w_green"] = w_green
-    temp["w_slope"] = w_slope
-
-    # Salvo lo score di tutti i POI raggiungibili
-    risultati_tutti_score.append(temp)
-
-    # TOP1: POI con score più alto per ogni abitazione
-    top1 = (
-        temp.sort_values(["casa_id", "score"], ascending=[True, False]) #Ordina la tabella prima per id della casa con ordine crescente e poi per score del POI con ordine decrescente. 
-            .groupby("casa_id") #Raggruppa per abitazione
-            .head(1) #Prende solo il primo POI per ogni abitazione, cioè quello con lo score più alto.
+    # Combine trafic, trottoir, espaces verts et pente avec les poids tirés.
+    tabella_simulazione["qualita"] = (
+        peso_traffico * tabella_simulazione["traf_mean"] +
+        peso_marciapiede * tabella_simulazione["marcia_mean"] +
+        peso_verde * tabella_simulazione["green_mean"] +
+        peso_pendenza * tabella_simulazione["slope_mean"]
     )
 
-    risultati_top1.append(top1) #Salva i risultati della simulazione corrente nella lista dei risultati top1.
+    # Combine la proximité et la qualité pour obtenir le score final.
+    tabella_simulazione["score"] = (
+        PESO_VICINANZA * tabella_simulazione["vicinanza"] +
+        PESO_QUALITA * tabella_simulazione["qualita"]
+    )
 
-    # TOP3: primi tre POI con score più alto per ogni abitazione
-    top3 = (
-        temp.sort_values(["casa_id", "score"], ascending=[True, False])
+    # Conserve le numéro de la simulation et les quatre poids utilisés.
+    tabella_simulazione["sim"] = numero_simulazione
+    tabella_simulazione["w_traf"] = peso_traffico
+    tabella_simulazione["w_marcia"] = peso_marciapiede
+    tabella_simulazione["w_green"] = peso_verde
+    tabella_simulazione["w_slope"] = peso_pendenza
+
+    risultati_score.append(tabella_simulazione)  # Garde le score de tous les POI.
+
+    # Sélectionne le POI avec le score le plus élevé pour chaque domicile.
+    top1_simulazione = (
+        tabella_simulazione.sort_values(["casa_id", "score"], ascending=[True, False])
             .groupby("casa_id")
-            .head(3) #Stessa cosa, ma mette 3 POI al posto di quello più alto e basta. Ottiene dunque i 3 POI con lo score più alto.
+            .head(1)
     )
 
-    risultati_top3.append(top3) #Salva i risultati della simulazione corrente nella lista dei risultati top3.
+    risultati_top1.append(top1_simulazione)
+
+    # Même classement, mais en conservant les trois premiers POI.
+    top3_simulazione = (
+        tabella_simulazione.sort_values(["casa_id", "score"], ascending=[True, False])
+            .groupby("casa_id")
+            .head(3)
+    )
+
+    risultati_top3.append(top3_simulazione)
     
 # ============================================================
-# STEP 7 - Riassunti finali del Monte Carlo
+# ÉTAPE 7 - Synthèse du Monte Carlo
 # ============================================================
+# Réunit les résultats des 1 000 simulations pour calculer la fréquence du
+# TOP1, du TOP3 et la variation du score de chaque POI.
 
-# Unisco le 1000 simulazioni
-risultati_top1 = pd.concat(risultati_top1, ignore_index=True) #Qui unisce tutte le tabelle TOP1 salvate nelle 1000 simulazioni. pd.concat() prende una lista di DataFrame e li unisce in un unico DataFrame. ignore_index=True significa che l'indice del nuovo DataFrame sarà riassegnato da 0 a n-1, ignorando gli indici originali dei DataFrame concatenati.
+# Réunit les TOP1 produits séparément dans les 1 000 simulations.
+risultati_top1 = pd.concat(risultati_top1, ignore_index=True)
 
-risultati_top3 = pd.concat(risultati_top3, ignore_index=True) #Stessa cosa ma per TOP3.
+# Réunit de la même manière tous les TOP3.
+risultati_top3 = pd.concat(risultati_top3, ignore_index=True)
 
-risultati_tutti_score = pd.concat( #Stessa cosa ma per tutti i POI raggiungibili. Qui unisce tutte le tabelle con lo score di tutti i POI salvate nelle 1000 simulazioni.
-    risultati_tutti_score,
+# Réunit enfin les scores de tous les POI.
+risultati_score = pd.concat(
+    risultati_score,
     ignore_index=True
 )
 
-# ------------------------------------------------
-# TOP1
-# ------------------------------------------------
+# TOP1: compte le nombre de fois où chaque POI arrive en première position.
 
-summary_top1 = ( #Calcola quante volte ogni POI è stato il migliore per ogni casa nelle 1000 simulazioni. Raggruppa per casa e POI e conta quante volte il POI è stato il migliore. Salva il risultato in summary_top1.
+riepilogo_top1 = (
     risultati_top1
-    .groupby(["casa_id", "poi_id", "poi_name"]) #Raggruppa
-    .size() #Conta quante volte ogni POI è stato il migliore per ogni casa. Conta le righe di ogni gruppo.
-    .reset_index(name="n_top1") #Trasforma il risultato in un DataFrame con una nuova colonna chiamata "n_top1" che contiene il conteggio.
+    .groupby(["casa_id", "poi_id", "poi_name"])
+    .size()
+    .reset_index(name="n_top1")
 )
 
-# Probabilità di essere il POI migliore
-summary_top1["prob_top1"] = (
-    summary_top1["n_top1"] / N_SIM #Viene trasformato il numero di vittorie in probabilità.
+riepilogo_top1["prob_top1"] = (
+    riepilogo_top1["n_top1"] / NUMERO_SIMULAZIONI  # Transforme le nombre en probabilité.
 )
 
-summary_top1 = summary_top1.sort_values( #Ordina la tabella prima per casa con ordine crescente e poi per probabilità di essere il POI migliore con ordine decrescente. Così per ogni casa vedo subito qual è il POI più probabile.
+riepilogo_top1 = riepilogo_top1.sort_values(
     ["casa_id", "prob_top1"],
     ascending=[True, False]
 )
 
-# ------------------------------------------------
-# TOP3
-# ------------------------------------------------
+# TOP3: compte le nombre de fois où chaque POI apparaît dans les trois premiers.
 
-summary_top3 = ( #Stessa logica del TOP1 ma quante quante volte compare nei primi 3.
+riepilogo_top3 = (
     risultati_top3
     .groupby(["casa_id", "poi_id", "poi_name"])
     .size()
     .reset_index(name="n_top3")
 )
 
-# Probabilità di comparire nei primi 3 POI
-summary_top3["prob_top3"] = (
-    summary_top3["n_top3"] / N_SIM
+riepilogo_top3["prob_top3"] = (
+    riepilogo_top3["n_top3"] / NUMERO_SIMULAZIONI  # Transforme le nombre en probabilité.
 )
 
-summary_top3 = summary_top3.sort_values(
+riepilogo_top3 = riepilogo_top3.sort_values(
     ["casa_id", "prob_top3"],
     ascending=[True, False]
 )
 
-# ------------------------------------------------
-# Score medio di tutti i POI
-# ------------------------------------------------
+# Calcule la moyenne et la variation du score pour chaque couple domicile-POI.
 
-summary_score = (
+riepilogo_score = (
 
-    risultati_tutti_score
+    risultati_score
 
-    .groupby(["casa_id", "poi_id", "poi_name"]) #Raggruppa
+    .groupby(["casa_id", "poi_id", "poi_name"])
 
-    .agg( #Qui calcoli statistiche sullo score. PEr ogni casa->POI hai mille score, uno per simulazione.
-        score_medio=("score", "mean"), #Qui calcoli la media dello score per ogni casa->POI. score_medio diventa la media dei mille score. Se Alto allora è un POI generalmente buono. Da guardare sempre con la deviazione standard. esempi omedie o.78 e std 0.03 allora buono. se media 0.60 e std 0.18 allora può esseere buono o meno a seonda dei pesi assegnati.
-        score_min=("score", "min"), #Qui calcoli il minimo dello score per ogni casa->POI. score_min diventa il minimo dei mille score.
-        score_max=("score", "max"), #Qui calcoli il massimo dello score per ogni casa->POI. score_max diventa il massimo dei mille score.
-        score_std=("score", "std"),#Qui calcoli la deviazione standard dello score per ogni casa->POI. score_std diventa la deviazione standard dei mille score. Se alto, vuol dire che il poi è molto senbile dal cambiamento dei pesi. Dunque da cosa viene considerato importante. Se basso allora resta buono anche cxambiando i pesi.
+    .agg(
+        score_medio=("score", "mean"),  # Score moyen.
+        score_min=("score", "min"),  # Score le plus faible.
+        score_max=("score", "max"),  # Score le plus élevé.
+        score_std=("score", "std"),  # Variation du score.
 
-        tempo_min=("tempo_min", "first"), #Conservo il tempo di percorrenza. Uso first perchè il tempo non cambia.
+        # Ces valeurs ne changent pas entre les simulations.
+        tempo_min=("tempo_min", "first"),
 
-        traf_mean=("traf_mean", "first"), #Questi valori non cambiano
+        traf_mean=("traf_mean", "first"),
         marcia_mean=("marcia_mean", "first"),
         green_mean=("green_mean", "first"),
         slope_mean=("slope_mean", "first")
     )
 
-    .reset_index() #Riporta il risultato in forma di tabella normale.
+    .reset_index()
 )
 
-summary_score = summary_score.sort_values( #Ordino per casa poi per score medio decrescente.
+riepilogo_score = riepilogo_score.sort_values(
     ["casa_id", "score_medio"],
     ascending=[True, False]
 )
 # ============================================================
-# STEP 8 - Salvataggio dei risultati
+# ÉTAPE 8 - Export des résultats
 # ============================================================
+# Enregistre les trois tableaux finaux dans le dossier du script et vérifie
+# que tous les domiciles sont encore présents dans les résultats.
+# Les noms des fichiers peuvent être changés dans les lignes ci-dessous.
 
-summary_top1.to_csv( #Salvo i file in csv.
-    os.path.join(SCRIPT_DIR, "risultati_top1.csv"), #SCRIPT_DIR contiene il percordo della cartella dove sto lavorando.
+# Enregistre les probabilités TOP1.
+riepilogo_top1.to_csv(
+    os.path.join(CARTELLA_SCRIPT, "risultati_top1.csv"),
     index=False
 )
 
-summary_top3.to_csv(
-    os.path.join(SCRIPT_DIR, "risultati_top3.csv"),
+# Enregistre les probabilités TOP3.
+riepilogo_top3.to_csv(
+    os.path.join(CARTELLA_SCRIPT, "risultati_top3.csv"),
     index=False
 )
 
-summary_score.to_csv(
-    os.path.join(SCRIPT_DIR, "risultati_score_tutti_poi.csv"),
+# Enregistre les statistiques de score de tous les POI.
+riepilogo_score.to_csv(
+    os.path.join(CARTELLA_SCRIPT, "risultati_score_tutti_poi.csv"),
     index=False
 )
 
+# Affiche les noms des fichiers créés.
 print("\nFile salvati:")
 print("- risultati_top1.csv")
 print("- risultati_top3.csv")
 print("- risultati_score_tutti_poi.csv")
 
-# Controllo finale
-print("\nControllo numero abitazioni:") #Controllo che le case sono tutte in tutte le analisi fatte.
+# Vérifie que les 40 domiciles sont présents dans chaque résultat.
+print("\nControllo numero abitazioni:")
 
 print("Case iniziali:",
       abitazioni["id"].nunique())
@@ -719,10 +765,10 @@ print("Case Monte Carlo:",
       percorsi_mc["casa_id"].nunique())
 
 print("Case TOP1:",
-      summary_top1["casa_id"].nunique())
+      riepilogo_top1["casa_id"].nunique())
 
 print("Case TOP3:",
-      summary_top3["casa_id"].nunique())
+      riepilogo_top3["casa_id"].nunique())
 
 print("Case score medio:",
-      summary_score["casa_id"].nunique())
+      riepilogo_score["casa_id"].nunique())
